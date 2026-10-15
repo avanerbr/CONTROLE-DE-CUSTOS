@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import type { Category, ExpenseView, GroupType } from "@/types/database";
 import { currentMonthRef, formatBRL } from "@/lib/utils";
@@ -23,6 +23,7 @@ export default function DespesasPage() {
   const [expenses, setExpenses] = useState<ExpenseView[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  const recurringSyncRef = useRef(false);
 
   const [categoryId, setCategoryId] = useState("");
   const [amount, setAmount] = useState("");
@@ -33,79 +34,104 @@ export default function DespesasPage() {
   const [error, setError] = useState<string | null>(null);
 
   async function loadCategories() {
-    const { data } = await supabase
+    const { data, error: queryError } = await supabase
       .from("categories")
       .select("*")
       .eq("archived", false)
       .order("group_type")
       .order("name");
-    if (data) {
-      setCategories(data as Category[]);
-      if (!categoryId && data.length > 0) setCategoryId((data as Category[])[0].id);
-    }
-    return (data ?? []) as Category[];
+
+    // Nunca interprete uma falha de leitura como ausência de categorias.
+    if (queryError || !data) throw new Error("Não foi possível consultar as categorias.");
+    setCategories(data as Category[]);
+    if (!categoryId && data.length > 0) setCategoryId((data as Category[])[0].id);
+    return data as Category[];
   }
 
   async function loadExpenses() {
-    const { data } = await supabase
+    const { data, error: queryError } = await supabase
       .from("expenses_view")
       .select("*")
       .eq("month_ref", month)
       .order("expense_date", { ascending: false });
-    if (data) setExpenses(data as ExpenseView[]);
-    return (data ?? []) as ExpenseView[];
+
+    if (queryError || !data) throw new Error("Não foi possível consultar as despesas.");
+    setExpenses(data as ExpenseView[]);
+    return data as ExpenseView[];
   }
 
-  // Garante que toda categoria "recorrente" já tenha um lançamento no mês
-  // selecionado, copiando o valor do mês anterior (editável depois).
+  // Gera as contas recorrentes somente após confirmar que as consultas funcionaram.
+  // Falha de leitura jamais deve ser interpretada como mês vazio.
   async function ensureRecurringExpenses(cats: Category[], monthRef: string) {
+    if (recurringSyncRef.current) return;
     const recurringCats = cats.filter((c) => c.recurring && !c.archived);
     if (recurringCats.length === 0) return;
 
-    const { data: existing } = await supabase
-      .from("expenses_view")
-      .select("category_id")
-      .eq("month_ref", monthRef);
-
-    const existingIds = new Set((existing ?? []).map((e: { category_id: string }) => e.category_id));
-    const missing = recurringCats.filter((c) => !existingIds.has(c.id));
-    if (missing.length === 0) return;
-
+    recurringSyncRef.current = true;
     setSyncing(true);
+    try {
+      const { data: existing, error: existingError } = await supabase
+        .from("expenses_view")
+        .select("category_id")
+        .eq("month_ref", monthRef);
+      if (existingError || !existing) {
+        throw new Error("Não foi possível verificar as contas existentes. Nenhuma despesa automática foi criada.");
+      }
 
-    const toInsert = [];
-    for (const cat of missing) {
-      const { data: previous } = await supabase
-        .from("expenses")
-        .select("amount")
-        .eq("category_id", cat.id)
-        .lt("expense_date", monthRef)
-        .order("expense_date", { ascending: false })
-        .limit(1);
+      const existingIds = new Set(existing.map((e: { category_id: string }) => e.category_id));
+      const missing = recurringCats.filter((c) => !existingIds.has(c.id));
+      if (missing.length === 0) return;
 
-      const previousAmount = previous && previous.length > 0 ? previous[0].amount : 0;
+      const toInsert: { category_id: string; amount: number; expense_date: string; paid: boolean }[] = [];
+      for (const cat of missing) {
+        const { data: previous, error: previousError } = await supabase
+          .from("expenses")
+          .select("amount")
+          .eq("category_id", cat.id)
+          .lt("expense_date", monthRef)
+          .order("expense_date", { ascending: false })
+          .limit(1);
+        if (previousError || !previous) {
+          throw new Error("Falha ao consultar valores anteriores. Nenhuma despesa automática foi criada.");
+        }
 
-      toInsert.push({
-        category_id: cat.id,
-        amount: previousAmount,
-        expense_date: monthRef,
-        paid: false,
-      });
+        const previousAmount = previous.length > 0 ? Number(previous[0].amount) : 0;
+        toInsert.push({ category_id: cat.id, amount: previousAmount, expense_date: monthRef, paid: false });
+      }
+
+      // Releitura imediatamente antes da gravação, para evitar duplicações
+      // caso outro carregamento tenha preenchido o mês durante a preparação.
+      const { data: latest, error: latestError } = await supabase
+        .from("expenses_view")
+        .select("category_id")
+        .eq("month_ref", monthRef);
+      if (latestError || !latest) {
+        throw new Error("Falha na conferência final. Nenhuma despesa automática foi criada.");
+      }
+      const latestIds = new Set(latest.map((e: { category_id: string }) => e.category_id));
+      const trulyMissing = toInsert.filter((e) => !latestIds.has(e.category_id));
+      if (trulyMissing.length > 0) {
+        const { error: insertError } = await supabase.from("expenses").insert(trulyMissing);
+        if (insertError) throw new Error("Não foi possível gerar as despesas recorrentes.");
+      }
+    } finally {
+      recurringSyncRef.current = false;
+      setSyncing(false);
     }
-
-    if (toInsert.length > 0) {
-      await supabase.from("expenses").insert(toInsert);
-    }
-
-    setSyncing(false);
   }
 
   async function refreshAll() {
     setLoading(true);
-    const cats = await loadCategories();
-    await ensureRecurringExpenses(cats, month);
-    await loadExpenses();
-    setLoading(false);
+    setError(null);
+    try {
+      const cats = await loadCategories();
+      await ensureRecurringExpenses(cats, month);
+      await loadExpenses();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Falha ao carregar despesas.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   useEffect(() => {
